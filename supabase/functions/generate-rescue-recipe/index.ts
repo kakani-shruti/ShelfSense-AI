@@ -93,14 +93,12 @@ async function callGemini(apiKey: string, model: string, prompt: string, repair 
 
 async function generateValidRecipes(apiKey: string, model: string, prompt: string) {
   try {
-    // JSON mode is more portable across Gemini models than responseSchema.
-    // The payload is still strictly checked by validateRecipeResponse below.
-    return parseGeminiResponse(await callGemini(apiKey, model, prompt, false, false))
+    return parseGeminiResponse(await callGemini(apiKey, model, prompt, false, true))
   } catch (firstError) {
     if (firstError instanceof DOMException && firstError.name === 'TimeoutError') throw firstError
     if (firstError instanceof GeminiRequestError) throw firstError
     console.warn('Recipe response validation failed; retrying with a stricter prompt.', firstError instanceof Error ? firstError.message : 'Unknown validation error')
-    return parseGeminiResponse(await callGemini(apiKey, model, prompt, true, false))
+    return parseGeminiResponse(await callGemini(apiKey, model, prompt, true, true))
   }
 }
 
