@@ -41,7 +41,6 @@ class GeminiRequestError extends Error {
 }
 
 const transientGeminiStatus = (status: number) => status === 408 || status === 429 || status >= 500
-const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 function buildPrompt(primary: Record<string, any>, prediction: Record<string, any>, inventory: Record<string, any>[]) {
   const expiry = estimatedExpiry(primary)
@@ -99,27 +98,11 @@ async function callGemini(apiKey: string, model: string, prompt: string, repair 
   const generationConfig: Record<string, unknown> = { responseMimeType: 'application/json', temperature: repair ? 0.35 : 0.65, maxOutputTokens: 8192 }
   if (structured) generationConfig.responseSchema = responseSchema
   const requestBody = JSON.stringify({ systemInstruction: { parts: [{ text: 'Follow the food-rescue rules exactly. Never output markdown.' }] }, contents: [{ role: 'user', parts: [{ text: repair ? `${prompt}\nThe previous response was incomplete or invalid. Return one complete JSON object containing exactly three valid recipes.` : prompt }] }], generationConfig })
-  let lastError: unknown
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
-        method: 'POST', signal: AbortSignal.timeout(25_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: requestBody,
-      })
-      if (!response.ok) {
-        const error = new GeminiRequestError(response.status, await response.text())
-        if (!transientGeminiStatus(error.status) || attempt === 1) throw error
-        lastError = error
-      } else {
-        return response.json()
-      }
-    } catch (error) {
-      if (error instanceof GeminiRequestError && !transientGeminiStatus(error.status)) throw error
-      if (attempt === 1) throw error
-      lastError = error
-    }
-    await delay(600 + Math.floor(Math.random() * 400))
-  }
-  throw lastError || new Error('Gemini request failed without a response.')
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
+    method: 'POST', signal: AbortSignal.timeout(25_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: requestBody,
+  })
+  if (!response.ok) throw new GeminiRequestError(response.status, await response.text())
+  return response.json()
 }
 
 async function generateValidRecipes(apiKey: string, model: string, prompt: string) {
@@ -170,7 +153,7 @@ Deno.serve(async (request) => {
     const { data: cached } = await client.from('recipes').select('*').eq('context_signature', signature).eq('generated_by', 'gemini').order('generated_at', { ascending: false }).limit(3)
     if (cached?.length === 3 && cacheIsFresh(cached[0].generated_at)) return json({ recipes: cached, insight: cached[0].ai_insight, cached: true })
     const prompt = buildPrompt(primary, prediction, inventory || [])
-    const preferredModel = Deno.env.get('GEMINI_MODEL') || 'gemini-2.5-flash'
+    const preferredModel = Deno.env.get('GEMINI_MODEL') || 'gemini-2.5-flash-lite'
     let generated
     let generationError: unknown
     const attemptedModels = new Set<string>()
@@ -179,20 +162,22 @@ Deno.serve(async (request) => {
       console.info(`Trying Gemini model: ${normalizeModelName(model)}`)
       return generateValidRecipes(geminiKey, model, prompt)
     }
-    try {
-      generated = await tryModel(preferredModel)
-    } catch (modelError) {
-      generationError = modelError
-      if (!(modelError instanceof GeminiRequestError) || !(modelError.status === 404 || transientGeminiStatus(modelError.status))) throw modelError
-      const availableModels = await discoverGeminiModels(geminiKey, preferredModel)
-      for (const model of availableModels.filter((name: string) => !attemptedModels.has(name)).slice(0, 2)) {
-        try {
-          generated = await tryModel(model)
-          generationError = null
-          break
-        } catch (fallbackError) {
-          generationError = fallbackError
-          if (!(fallbackError instanceof GeminiRequestError) || !(fallbackError.status === 404 || transientGeminiStatus(fallbackError.status))) throw fallbackError
+    const stableModels = [preferredModel, 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
+    let candidates = [...new Set(stableModels.map(normalizeModelName))]
+    let addedDiscoveredModel = false
+    for (let index = 0; index < candidates.length; index += 1) {
+      const model = candidates[index]
+      try {
+        generated = await tryModel(model)
+        generationError = null
+        break
+      } catch (modelError) {
+        generationError = modelError
+        if (!(modelError instanceof GeminiRequestError) || !(modelError.status === 404 || transientGeminiStatus(modelError.status))) throw modelError
+        if (index === candidates.length - 1 && !addedDiscoveredModel) {
+          addedDiscoveredModel = true
+          const discovered = await discoverGeminiModels(geminiKey, preferredModel)
+          candidates = [...candidates, ...discovered.filter((name: string) => !attemptedModels.has(name)).slice(0, 1)]
         }
       }
     }
