@@ -45,12 +45,11 @@ npm run build
 
 ## GitHub Pages deployment
 
-The workflow in `.github/workflows/deploy-pages.yml` builds and deploys the
-production `dist` directory whenever `main` is pushed. In the repository's
-**Settings → Pages**, set **Source** to **GitHub Actions**. Add
-`VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` under
-**Settings → Secrets and variables → Actions → Repository secrets** so the
-deployed build can connect to Supabase.
+GitHub Pages publishes the compiled production build from the `SK-Cut` branch.
+Build with the configured `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, then
+publish the contents of `dist/` at that branch's root. Keep application source
+on `main`; publishing the raw source directory will not work because browsers
+cannot run Vite's `/src/main.jsx` entry point directly.
 
 ### Browser environment
 
