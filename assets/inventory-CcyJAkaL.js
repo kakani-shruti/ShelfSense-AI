@@ -1,4 +1,4 @@
-import{i as r,s as i}from"./index-DtDdvq-X.js";const o=`
+import{i as r,s as i}from"./index-BUnagC4J.js";const o=`
   id, user_id, food_id, quantity_purchased, quantity_remaining, unit,
   purchase_date, storage_type, custom_expiry_date, purchase_price, status,
   notes, created_at, updated_at,
