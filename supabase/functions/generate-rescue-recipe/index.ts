@@ -32,15 +32,19 @@ const responseSchema = { type: 'object', properties: { insight: { type: 'string'
 class GeminiRequestError extends Error {
   status: number
   code: string | null
-  constructor(status: number, detail: string) {
+  retryAfterSeconds: number | null
+  constructor(status: number, detail: string, retryAfter: string | null = null) {
     super(`Gemini request failed with status ${status}: ${detail.slice(0, 500)}`)
     this.name = 'GeminiRequestError'
     this.status = status
+    const retrySeconds = Number(retryAfter)
+    this.retryAfterSeconds = Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds : null
     try { this.code = JSON.parse(detail)?.error?.status || null } catch { this.code = null }
   }
 }
 
 const transientGeminiStatus = (status: number) => status === 408 || status === 429 || status >= 500
+const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 function buildPrompt(primary: Record<string, any>, prediction: Record<string, any>, inventory: Record<string, any>[]) {
   const expiry = estimatedExpiry(primary)
@@ -95,14 +99,22 @@ async function discoverGeminiModels(apiKey: string, excludedModel: string) {
 }
 
 async function callGemini(apiKey: string, model: string, prompt: string, repair = false, structured = true) {
-  const generationConfig: Record<string, unknown> = { responseMimeType: 'application/json', temperature: repair ? 0.35 : 0.65, maxOutputTokens: 8192 }
+  const generationConfig: Record<string, unknown> = { responseMimeType: 'application/json', temperature: repair ? 0.35 : 0.65, maxOutputTokens: 4096 }
   if (structured) generationConfig.responseSchema = responseSchema
   const requestBody = JSON.stringify({ systemInstruction: { parts: [{ text: 'Follow the food-rescue rules exactly. Never output markdown.' }] }, contents: [{ role: 'user', parts: [{ text: repair ? `${prompt}\nThe previous response was incomplete or invalid. Return one complete JSON object containing exactly three valid recipes.` : prompt }] }], generationConfig })
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
-    method: 'POST', signal: AbortSignal.timeout(25_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: requestBody,
-  })
-  if (!response.ok) throw new GeminiRequestError(response.status, await response.text())
-  return response.json()
+  let lastError: unknown
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
+      method: 'POST', signal: AbortSignal.timeout(25_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: requestBody,
+    })
+    if (response.ok) return response.json()
+    const error = new GeminiRequestError(response.status, await response.text(), response.headers.get('retry-after'))
+    lastError = error
+    if (attempt === 1 || !transientGeminiStatus(error.status)) throw error
+    const seconds = error.retryAfterSeconds ?? (error.status === 429 ? 8 : 2)
+    await delay(Math.min(seconds, 12) * 1000)
+  }
+  throw lastError || new Error('Gemini request failed without a response.')
 }
 
 async function generateValidRecipes(apiKey: string, model: string, prompt: string) {
