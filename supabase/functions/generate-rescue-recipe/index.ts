@@ -72,32 +72,6 @@ function normalizeModelName(value: string) {
   return name
 }
 
-async function discoverGeminiModels(apiKey: string, excludedModel: string) {
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', {
-    signal: AbortSignal.timeout(10_000),
-    headers: { 'x-goog-api-key': apiKey },
-  })
-  if (!response.ok) throw new GeminiRequestError(response.status, await response.text())
-  const payload = await response.json()
-  const excluded = normalizeModelName(excludedModel)
-  const candidates = (payload.models || [])
-    .filter((model: Record<string, any>) => model.supportedGenerationMethods?.includes('generateContent'))
-    .map((model: Record<string, any>) => normalizeModelName(String(model.name || '')))
-    .filter((name: string) => name !== excluded && name.startsWith('gemini-') && !/(embedding|imagen|veo|aqa|live|tts|image)/i.test(name))
-    .sort((a: string, b: string) => {
-      const score = (name: string) => {
-        let value = /-flash$/i.test(name) ? 500 : /flash/i.test(name) ? 400 : /pro/i.test(name) ? 200 : 0
-        if (/latest/i.test(name)) value += 100
-        if (/(preview|experimental|exp)/i.test(name)) value -= 150
-        if (/lite/i.test(name)) value -= 25
-        return value
-      }
-      return score(b) - score(a) || b.localeCompare(a, undefined, { numeric: true })
-    })
-  if (!candidates.length) throw new GeminiRequestError(404, 'No available Gemini model supports generateContent.')
-  return candidates
-}
-
 async function callGemini(apiKey: string, model: string, prompt: string, repair = false, structured = true) {
   const generationConfig: Record<string, unknown> = { responseMimeType: 'application/json', temperature: repair ? 0.35 : 0.65, maxOutputTokens: 4096 }
   if (structured) generationConfig.responseSchema = responseSchema
@@ -165,7 +139,7 @@ Deno.serve(async (request) => {
     const { data: cached } = await client.from('recipes').select('*').eq('context_signature', signature).eq('generated_by', 'gemini').order('generated_at', { ascending: false }).limit(3)
     if (cached?.length === 3 && cacheIsFresh(cached[0].generated_at)) return json({ recipes: cached, insight: cached[0].ai_insight, cached: true })
     const prompt = buildPrompt(primary, prediction, inventory || [])
-    const preferredModel = Deno.env.get('GEMINI_MODEL') || 'gemini-2.5-flash-lite'
+    const preferredModel = Deno.env.get('GEMINI_MODEL') || 'gemini-3.5-flash-lite'
     let generated
     let generationError: unknown
     const attemptedModels = new Set<string>()
@@ -174,9 +148,8 @@ Deno.serve(async (request) => {
       console.info(`Trying Gemini model: ${normalizeModelName(model)}`)
       return generateValidRecipes(geminiKey, model, prompt)
     }
-    const stableModels = [preferredModel, 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
-    let candidates = [...new Set(stableModels.map(normalizeModelName))]
-    let addedDiscoveredModel = false
+    const availableModels = [preferredModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite']
+    const candidates = [...new Set(availableModels.map(normalizeModelName))]
     for (let index = 0; index < candidates.length; index += 1) {
       const model = candidates[index]
       try {
@@ -186,11 +159,6 @@ Deno.serve(async (request) => {
       } catch (modelError) {
         generationError = modelError
         if (!(modelError instanceof GeminiRequestError) || !(modelError.status === 404 || transientGeminiStatus(modelError.status))) throw modelError
-        if (index === candidates.length - 1 && !addedDiscoveredModel) {
-          addedDiscoveredModel = true
-          const discovered = await discoverGeminiModels(geminiKey, preferredModel)
-          candidates = [...candidates, ...discovered.filter((name: string) => !attemptedModels.has(name)).slice(0, 1)]
-        }
       }
     }
     if (!generated) throw generationError || new Error('Gemini generation failed without a response.')
