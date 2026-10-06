@@ -124,11 +124,13 @@ async function callGemini(apiKey: string, model: string, prompt: string, repair 
 
 async function generateValidRecipes(apiKey: string, model: string, prompt: string) {
   try {
-    return parseGeminiResponse(await callGemini(apiKey, model, prompt))
+    // JSON mode is more portable across Gemini models than responseSchema.
+    // The payload is still strictly checked by validateRecipeResponse below.
+    return parseGeminiResponse(await callGemini(apiKey, model, prompt, false, false))
   } catch (firstError) {
     if (firstError instanceof DOMException && firstError.name === 'TimeoutError') throw firstError
-    if (firstError instanceof GeminiRequestError && firstError.status !== 400) throw firstError
-    console.warn('Structured recipe generation failed; retrying with JSON mode.', firstError instanceof Error ? firstError.message : 'Unknown validation error')
+    if (firstError instanceof GeminiRequestError) throw firstError
+    console.warn('Recipe response validation failed; retrying with a stricter prompt.', firstError instanceof Error ? firstError.message : 'Unknown validation error')
     return parseGeminiResponse(await callGemini(apiKey, model, prompt, true, false))
   }
 }
@@ -215,7 +217,7 @@ Deno.serve(async (request) => {
       if (error.status === 404) return json({ error: 'No text-generation model is available to this Gemini API project. Enable the Gemini API for the key’s project and try again.' }, 502)
       if (error.status === 429) return json({ error: 'Gemini rate limit or quota was reached. Wait briefly or check the API project quota, then try again.' }, 429)
       console.error('Gemini API failure.', error.message)
-      return json({ error: 'Gemini could not generate recipes right now. Please try again shortly.' }, 502)
+      return json({ error: `Gemini is unavailable (upstream status ${error.status}). Please try again shortly.` }, 502)
     }
     return json({ error: 'AI rescue is temporarily unavailable. Your waste-risk analysis is still working normally.' }, 500)
   }
