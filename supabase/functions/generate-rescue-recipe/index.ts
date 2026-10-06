@@ -31,12 +31,17 @@ const responseSchema = { type: 'object', properties: { insight: { type: 'string'
 
 class GeminiRequestError extends Error {
   status: number
+  code: string | null
   constructor(status: number, detail: string) {
     super(`Gemini request failed with status ${status}: ${detail.slice(0, 500)}`)
     this.name = 'GeminiRequestError'
     this.status = status
+    try { this.code = JSON.parse(detail)?.error?.status || null } catch { this.code = null }
   }
 }
+
+const transientGeminiStatus = (status: number) => status === 408 || status === 429 || status >= 500
+const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 function buildPrompt(primary: Record<string, any>, prediction: Record<string, any>, inventory: Record<string, any>[]) {
   const expiry = estimatedExpiry(primary)
@@ -93,18 +98,35 @@ async function discoverGeminiModels(apiKey: string, excludedModel: string) {
 async function callGemini(apiKey: string, model: string, prompt: string, repair = false, structured = true) {
   const generationConfig: Record<string, unknown> = { responseMimeType: 'application/json', temperature: repair ? 0.35 : 0.65, maxOutputTokens: 8192 }
   if (structured) generationConfig.responseSchema = responseSchema
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
-    method: 'POST', signal: AbortSignal.timeout(20_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: 'Follow the food-rescue rules exactly. Never output markdown.' }] }, contents: [{ role: 'user', parts: [{ text: repair ? `${prompt}\nThe previous response was incomplete or invalid. Return one complete JSON object containing exactly three valid recipes.` : prompt }] }], generationConfig }),
-  })
-  if (!response.ok) throw new GeminiRequestError(response.status, await response.text())
-  return response.json()
+  const requestBody = JSON.stringify({ systemInstruction: { parts: [{ text: 'Follow the food-rescue rules exactly. Never output markdown.' }] }, contents: [{ role: 'user', parts: [{ text: repair ? `${prompt}\nThe previous response was incomplete or invalid. Return one complete JSON object containing exactly three valid recipes.` : prompt }] }], generationConfig })
+  let lastError: unknown
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${normalizeModelName(model)}:generateContent`, {
+        method: 'POST', signal: AbortSignal.timeout(25_000), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: requestBody,
+      })
+      if (!response.ok) {
+        const error = new GeminiRequestError(response.status, await response.text())
+        if (!transientGeminiStatus(error.status) || attempt === 1) throw error
+        lastError = error
+      } else {
+        return response.json()
+      }
+    } catch (error) {
+      if (error instanceof GeminiRequestError && !transientGeminiStatus(error.status)) throw error
+      if (attempt === 1) throw error
+      lastError = error
+    }
+    await delay(600 + Math.floor(Math.random() * 400))
+  }
+  throw lastError || new Error('Gemini request failed without a response.')
 }
 
 async function generateValidRecipes(apiKey: string, model: string, prompt: string) {
   try {
     return parseGeminiResponse(await callGemini(apiKey, model, prompt))
   } catch (firstError) {
+    if (firstError instanceof DOMException && firstError.name === 'TimeoutError') throw firstError
     if (firstError instanceof GeminiRequestError && firstError.status !== 400) throw firstError
     console.warn('Structured recipe generation failed; retrying with JSON mode.', firstError instanceof Error ? firstError.message : 'Unknown validation error')
     return parseGeminiResponse(await callGemini(apiKey, model, prompt, true, false))
@@ -159,7 +181,7 @@ Deno.serve(async (request) => {
       generated = await tryModel(preferredModel)
     } catch (modelError) {
       generationError = modelError
-      if (!(modelError instanceof GeminiRequestError) || ![404, 429].includes(modelError.status)) throw modelError
+      if (!(modelError instanceof GeminiRequestError) || !(modelError.status === 404 || transientGeminiStatus(modelError.status))) throw modelError
       const availableModels = await discoverGeminiModels(geminiKey, preferredModel)
       for (const model of availableModels.filter((name: string) => !attemptedModels.has(name)).slice(0, 2)) {
         try {
@@ -168,7 +190,7 @@ Deno.serve(async (request) => {
           break
         } catch (fallbackError) {
           generationError = fallbackError
-          if (!(fallbackError instanceof GeminiRequestError) || ![404, 429].includes(fallbackError.status)) throw fallbackError
+          if (!(fallbackError instanceof GeminiRequestError) || !(fallbackError.status === 404 || transientGeminiStatus(fallbackError.status))) throw fallbackError
         }
       }
     }
@@ -187,7 +209,9 @@ Deno.serve(async (request) => {
     console.error('Recipe generation failed:', error instanceof Error ? error.message : 'Unknown error')
     if (error instanceof DOMException && error.name === 'TimeoutError') return json({ error: 'AI rescue timed out. Please try again.' }, 504)
     if (error instanceof GeminiRequestError) {
-      if (error.status === 401 || error.status === 403) return json({ error: 'Gemini rejected the configured API key. Update GEMINI_API_KEY and redeploy the function.' }, 502)
+      if (error.status === 401 || error.status === 403 || error.code === 'PERMISSION_DENIED') return json({ error: 'Gemini rejected the configured API key or API access. Verify GEMINI_API_KEY and that the Gemini API is enabled for its Google project.' }, 502)
+      if (error.status === 400 && error.code === 'FAILED_PRECONDITION') return json({ error: 'Gemini requires billing for requests from this region. Enable billing for the API key’s Google project and try again.' }, 502)
+      if (error.status === 400) return json({ error: 'Gemini rejected the recipe request. Verify the configured API key and model, then try again.' }, 502)
       if (error.status === 404) return json({ error: 'No text-generation model is available to this Gemini API project. Enable the Gemini API for the key’s project and try again.' }, 502)
       if (error.status === 429) return json({ error: 'Gemini rate limit or quota was reached. Wait briefly or check the API project quota, then try again.' }, 429)
       console.error('Gemini API failure.', error.message)
