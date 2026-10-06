@@ -2,6 +2,9 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
+  // Relative asset URLs work both locally and when GitHub Pages serves the app
+  // from a repository subpath such as /ShelfSense-AI/.
+  base: './',
   plugins: [react()],
   build: {
     rollupOptions: {
