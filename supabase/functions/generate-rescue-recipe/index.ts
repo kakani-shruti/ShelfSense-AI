@@ -1,5 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
-import { authorizeInventory, cacheIsFresh, canRescueItem, parseGeminiResponse, validateRecipeResponse } from '../_shared/recipeValidation.js'
+import { authorizeInventory, canRescueItem, parseGeminiResponse, validateRecipeResponse } from '../_shared/recipeValidation.js'
 
 const corsHeaders = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
@@ -46,7 +46,7 @@ class GeminiRequestError extends Error {
 const transientGeminiStatus = (status: number) => status === 408 || status === 429 || status >= 500
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
-function buildPrompt(primary: Record<string, any>, prediction: Record<string, any>, inventory: Record<string, any>[]) {
+function buildPrompt(primary: Record<string, any>, prediction: Record<string, any>, inventory: Record<string, any>[], recentRecipes: Record<string, any>[]) {
   const expiry = estimatedExpiry(primary)
   const available = inventory.filter((item) => item.id !== primary.id).slice(0, 20).map((item) => ({ name: item.food?.name, quantity: item.quantity_remaining, unit: item.unit, estimated_expiry: estimatedExpiry(item) }))
   let reasons: string[] = []
@@ -58,12 +58,15 @@ Rules:
 - Prefer foods listed in available inventory and label those ingredients source "inventory".
 - Never claim an unlisted ingredient is available; label it source "additional".
 - Minimize additional purchases. Keep recipes realistic for an ordinary home cook.
+- Create new concepts for this request. Do not repeat or closely paraphrase any previously generated title, cooking method, or dish listed below.
 - Do not calculate or alter the supplied risk score.
 - Do not claim food is safe. Shelf-life dates are application estimates, not safety guarantees.
 - No medical or unsupported food-safety claims. Return structured JSON only.
 
 At-risk food: ${JSON.stringify({ name: primary.food?.name, category: primary.food?.category, quantity: primary.quantity_remaining, unit: primary.unit, storage: primary.storage_type, estimated_expiry: expiry, days_remaining: daysRemaining(expiry), risk_score: prediction?.risk_score, risk_level: prediction?.risk_level, risk_reasons: reasons })}
-Available inventory: ${JSON.stringify(available)}`
+Available inventory: ${JSON.stringify(available)}
+Previously generated recipes to avoid: ${JSON.stringify(recentRecipes.map((recipe) => ({ title: recipe.title, description: recipe.description })).slice(0, 12))}
+Variation token for this request: ${crypto.randomUUID()}`
 }
 
 function normalizeModelName(value: string) {
@@ -134,9 +137,9 @@ Deno.serve(async (request) => {
     if (!rescueCheck.allowed) return json({ error: rescueCheck.reason }, 422)
     const signatureInput = [primary.id, primary.updated_at, prediction?.predicted_at, ...(inventory || []).map((item) => `${item.id}:${item.updated_at}`).sort()].join('|')
     const signature = await sha256(signatureInput)
-    const { data: cached } = await client.from('recipes').select('*').eq('context_signature', signature).eq('generated_by', 'gemini').order('generated_at', { ascending: false }).limit(3)
-    if (cached?.length === 3 && cacheIsFresh(cached[0].generated_at)) return json({ recipes: cached, insight: cached[0].ai_insight, cached: true })
-    const prompt = buildPrompt(primary, prediction, inventory || [])
+    const { data: recentRecipes, error: recentRecipesError } = await client.from('recipes').select('title, description').contains('source_inventory_item_ids', [primary.id]).eq('generated_by', 'gemini').order('generated_at', { ascending: false }).limit(12)
+    if (recentRecipesError) console.warn('Recent recipe history was unavailable; continuing without exclusions.', recentRecipesError.message)
+    const prompt = buildPrompt(primary, prediction, inventory || [], recentRecipes || [])
     const preferredModel = Deno.env.get('GEMINI_MODEL') || 'gemini-3.5-flash-lite'
     let generated
     let generationError: unknown
